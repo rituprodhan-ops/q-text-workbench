@@ -1,0 +1,363 @@
+name: Update Study Snapshot
+
+on:
+  schedule:
+    # 每天 UTC 03:00 触发一次，实际执行时间会在随机等待后错开
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      target_branch:
+        description: "导入到当前仓库的目标分支"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-study-snapshot-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Rfym21/Qwen2API
+  WORKFLOW_FILE: .github/workflows/pull-qwen-upstream.yml
+
+jobs:
+  update-snapshot:
+    name: Update study snapshot
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout current repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN || github.token }}
+
+      - name: Random delay for scheduled run
+        if: github.event_name == 'schedule'
+        run: |
+          RANDOM_DELAY="$(shuf -i 0-3600 -n 1)"
+          echo "定时任务随机等待 ${RANDOM_DELAY} 秒后继续执行..."
+          sleep "${RANDOM_DELAY}"
+          echo "随机等待结束，开始执行更新流程"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve upstream snapshot ref
+        id: resolve_ref
+        run: |
+          UPSTREAM_URL="https://github.com/${UPSTREAM_REPO}.git"
+
+          echo "开始解析上游快照来源..."
+
+          LATEST_TAG="$(git ls-remote --tags --refs "${UPSTREAM_URL}" \
+            | awk '{ print $2 }' \
+            | sed 's#refs/tags/##' \
+            | sort -V \
+            | tail -n 1)"
+
+          if [ -n "${LATEST_TAG}" ]; then
+            SNAPSHOT_REF="${LATEST_TAG}"
+            SNAPSHOT_TYPE="tag"
+            SNAPSHOT_VERSION="${LATEST_TAG}"
+            echo "检测到上游最新 tag，使用 tag 快照: ${SNAPSHOT_REF}"
+          else
+            DEFAULT_BRANCH="$(git ls-remote --symref "${UPSTREAM_URL}" HEAD \
+              | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2 }')"
+
+            if [ -z "${DEFAULT_BRANCH}" ]; then
+              echo "❌ 无法识别上游默认分支"
+              exit 1
+            fi
+
+            DEFAULT_COMMIT="$(git ls-remote "${UPSTREAM_URL}" "refs/heads/${DEFAULT_BRANCH}" \
+              | awk '{ print $1 }')"
+
+            if [ -z "${DEFAULT_COMMIT}" ]; then
+              echo "❌ 无法获取上游默认分支 commit"
+              exit 1
+            fi
+
+            SHORT_COMMIT="$(printf '%s' "${DEFAULT_COMMIT}" | cut -c1-12)"
+            SNAPSHOT_REF="${DEFAULT_BRANCH}"
+            SNAPSHOT_TYPE="branch"
+            SNAPSHOT_VERSION="snapshot-${SHORT_COMMIT}"
+
+            echo "上游没有 tag，使用默认分支快照: ${DEFAULT_BRANCH}"
+            echo "默认分支 commit: ${DEFAULT_COMMIT}"
+            echo "内部版本名: ${SNAPSHOT_VERSION}"
+          fi
+
+          echo "url=${UPSTREAM_URL}" >> "${GITHUB_OUTPUT}"
+          echo "ref=${SNAPSHOT_REF}" >> "${GITHUB_OUTPUT}"
+          echo "type=${SNAPSHOT_TYPE}" >> "${GITHUB_OUTPUT}"
+          echo "version=${SNAPSHOT_VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Backup current workflow file
+        run: |
+          BACKUP_DIR="/tmp/workflow-backup"
+
+          if [ ! -f "${WORKFLOW_FILE}" ]; then
+            echo "❌ 当前仓库中找不到 ${WORKFLOW_FILE}"
+            echo "请确认 workflow 文件路径正确"
+            exit 1
+          fi
+
+          rm -rf "${BACKUP_DIR}"
+          mkdir -p "${BACKUP_DIR}"
+
+          cp "${WORKFLOW_FILE}" "${BACKUP_DIR}/pull-qwen-upstream.yml"
+
+          echo "✅ 当前更新 workflow 文件已备份"
+
+      - name: Export upstream snapshot
+        run: |
+          UPSTREAM_URL="${{ steps.resolve_ref.outputs.url }}"
+          SNAPSHOT_REF="${{ steps.resolve_ref.outputs.ref }}"
+          SNAPSHOT_TYPE="${{ steps.resolve_ref.outputs.type }}"
+
+          echo "开始导出上游文件快照..."
+          echo "快照类型: ${SNAPSHOT_TYPE}"
+          echo "快照引用: ${SNAPSHOT_REF}"
+
+          rm -rf /tmp/upstream-snapshot
+          mkdir -p /tmp/upstream-snapshot
+
+          git init /tmp/upstream-snapshot
+          cd /tmp/upstream-snapshot
+
+          git remote add upstream "${UPSTREAM_URL}"
+
+          if [ "${SNAPSHOT_TYPE}" = "tag" ]; then
+            git fetch --force --depth=1 upstream "refs/tags/${SNAPSHOT_REF}:refs/tags/${SNAPSHOT_REF}"
+            git checkout --detach "refs/tags/${SNAPSHOT_REF}"
+          else
+            git fetch --force --depth=1 upstream "refs/heads/${SNAPSHOT_REF}:refs/remotes/upstream/${SNAPSHOT_REF}"
+            git checkout --detach "refs/remotes/upstream/${SNAPSHOT_REF}"
+          fi
+
+          echo "✅ 上游文件快照已导出"
+          git log -1 --oneline
+
+      - name: Import snapshot into clean orphan branch
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          SNAPSHOT_VERSION="${{ steps.resolve_ref.outputs.version }}"
+          BACKUP_DIR="/tmp/workflow-backup"
+          IMPORT_BRANCH="snapshot-import-${GITHUB_RUN_ID}"
+
+          if [ -z "${TARGET_BRANCH}" ]; then
+            TARGET_BRANCH="main"
+          fi
+
+          echo "创建干净的快照导入分支，避免携带上游 Git 历史: ${IMPORT_BRANCH}"
+          git checkout --orphan "${IMPORT_BRANCH}"
+
+          echo "清理当前工作区，仅保留 .git 目录..."
+          find . -mindepth 1 -maxdepth 1 ! -name ".git" -exec rm -rf {} +
+
+          echo "复制上游文件快照..."
+          rsync -a --delete --exclude=".git" /tmp/upstream-snapshot/ ./
+
+          echo "删除上游自带 workflow 文件..."
+          rm -rf .github/workflows
+
+          echo "恢复当前更新 workflow 文件..."
+          mkdir -p .github/workflows
+          cp "${BACKUP_DIR}/pull-qwen-upstream.yml" "${WORKFLOW_FILE}"
+
+          echo "✅ 已导入快照，并仅恢复当前更新 workflow 文件"
+          echo "当前快照版本: ${SNAPSHOT_VERSION}"
+
+      - name: Clean sensitive strings
+        run: |
+          echo "清理可能触发 GitHub Push Protection 的敏感字符串..."
+
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          SKIP_DIRS = {
+              ".git",
+              "node_modules",
+              "vendor",
+              "dist",
+              "build",
+              ".next",
+              ".cache",
+          }
+
+          TEXT_SUFFIXES = {
+              ".go", ".js", ".jsx", ".ts", ".tsx",
+              ".json", ".yaml", ".yml", ".toml", ".env",
+              ".md", ".txt", ".html", ".css", ".scss",
+              ".py", ".sh", ".bash", ".zsh",
+              ".java", ".kt", ".rs", ".php",
+              ".c", ".cpp", ".h", ".hpp",
+              ".xml", ".ini", ".conf",
+          }
+
+          PATTERNS = [
+              (
+                  re.compile(r"[0-9]{6,}-[A-Za-z0-9_-]{20,}\.apps\.googleusercontent\.com"),
+                  "GOOGLE_OAUTH_CLIENT_ID_PLACEHOLDER",
+              ),
+              (
+                  re.compile(r"GOCSPX-[A-Za-z0-9_-]{20,}"),
+                  "GOOGLE_OAUTH_CLIENT_SECRET_PLACEHOLDER",
+              ),
+          ]
+
+          changed_files = []
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+
+              for filename in files:
+                  path = Path(root) / filename
+
+                  if path.suffix.lower() not in TEXT_SUFFIXES:
+                      continue
+
+                  try:
+                      data = path.read_text(encoding="utf-8")
+                  except UnicodeDecodeError:
+                      continue
+                  except OSError:
+                      continue
+
+                  original = data
+
+                  for pattern, replacement in PATTERNS:
+                      data = pattern.sub(replacement, data)
+
+                  if data != original:
+                      path.write_text(data, encoding="utf-8")
+                      changed_files.append(str(path))
+
+          if changed_files:
+              print("已清理以下文件中的敏感字符串：")
+              for item in changed_files:
+                  print(f"- {item}")
+          else:
+              print("未发现需要清理的敏感字符串")
+          PY
+
+          echo "✅ 敏感字符串清理完成"
+
+      - name: Generate neutral README
+        run: |
+          SNAPSHOT_VERSION="${{ steps.resolve_ref.outputs.version }}"
+
+          echo "生成中性的学习项目 README..."
+
+          {
+            printf '%s\n' '# Programming Study Notes'
+            printf '%s\n' ''
+            printf '%s\n' '这是一个用于学习编程和熟悉工程实践的个人项目。'
+            printf '%s\n' ''
+            printf '%s\n' '## 项目用途'
+            printf '%s\n' ''
+            printf '%s\n' '本项目主要用于：'
+            printf '%s\n' ''
+            printf '%s\n' '- 学习基础编程结构'
+            printf '%s\n' '- 熟悉项目目录组织方式'
+            printf '%s\n' '- 练习配置文件管理'
+            printf '%s\n' '- 了解自动化流程'
+            printf '%s\n' '- 记录个人学习过程'
+            printf '%s\n' ''
+            printf '%s\n' '## 当前版本'
+            printf '%s\n' ''
+            printf '%s\n' "当前同步版本：${SNAPSHOT_VERSION}"
+            printf '%s\n' ''
+            printf '%s\n' '## 学习内容'
+            printf '%s\n' ''
+            printf '%s\n' '可以通过本项目了解以下内容：'
+            printf '%s\n' ''
+            printf '%s\n' '- 代码仓库的基本结构'
+            printf '%s\n' '- 配置文件的组织方式'
+            printf '%s\n' '- 自动化任务的执行流程'
+            printf '%s\n' '- 日志查看和问题排查'
+            printf '%s\n' '- 版本记录和变更管理'
+            printf '%s\n' ''
+            printf '%s\n' '## 注意事项'
+            printf '%s\n' ''
+            printf '%s\n' '本仓库仅用于个人学习和技术实践。'
+            printf '%s\n' ''
+            printf '%s\n' '请不要在仓库中提交任何敏感信息，例如：'
+            printf '%s\n' ''
+            printf '%s\n' '- 密码'
+            printf '%s\n' '- Token'
+            printf '%s\n' '- 私钥'
+            printf '%s\n' '- 账号信息'
+            printf '%s\n' '- 个人隐私数据'
+            printf '%s\n' ''
+            printf '%s\n' '## 维护说明'
+            printf '%s\n' ''
+            printf '%s\n' '后续可以根据学习进度继续补充：'
+            printf '%s\n' ''
+            printf '%s\n' '- 学习笔记'
+            printf '%s\n' '- 配置说明'
+            printf '%s\n' '- 运行记录'
+            printf '%s\n' '- 问题总结'
+            printf '%s\n' '- 改进计划'
+          } > README.md
+
+          echo "✅ README.md 已更新为学习项目说明"
+
+      - name: Commit cleaned snapshot
+        id: commit
+        run: |
+          TARGET_BRANCH="${{ github.event.inputs.target_branch }}"
+          SNAPSHOT_VERSION="${{ steps.resolve_ref.outputs.version }}"
+
+          if [ -z "${TARGET_BRANCH}" ]; then
+            TARGET_BRANCH="main"
+          fi
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "没有检测到文件变化，无需提交"
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+          else
+            git commit -m "chore: update programming study snapshot ${SNAPSHOT_VERSION}"
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+          git branch -M "${TARGET_BRANCH}"
+
+          echo "target_branch=${TARGET_BRANCH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Push clean branch and cleaned tag
+        run: |
+          TARGET_BRANCH="${{ steps.commit.outputs.target_branch }}"
+          SNAPSHOT_VERSION="${{ steps.resolve_ref.outputs.version }}"
+
+          echo "创建/更新当前仓库同名 tag，指向清理后的快照提交: ${SNAPSHOT_VERSION}"
+          git tag -d "${SNAPSHOT_VERSION}" 2>/dev/null || true
+          git tag -f -a "${SNAPSHOT_VERSION}" -m "Programming study snapshot ${SNAPSHOT_VERSION}" HEAD
+
+          echo "强制推送干净快照到当前私有仓库分支: ${TARGET_BRANCH}"
+          git push origin "HEAD:${TARGET_BRANCH}" --force
+
+          echo "推送清理后的同名 tag 到当前私有仓库: ${SNAPSHOT_VERSION}"
+          git push origin "refs/tags/${SNAPSHOT_VERSION}:refs/tags/${SNAPSHOT_VERSION}" --force
+
+          echo "✅ 干净分支和清理后的 tag 推送完成"
+
+      - name: Summary
+        run: |
+          echo "========================================"
+          echo "项目: Programming Study Notes"
+          echo "当前版本: ${{ steps.resolve_ref.outputs.version }}"
+          echo "目标分支: ${{ steps.commit.outputs.target_branch }}"
+          echo "是否有文件变化: ${{ steps.commit.outputs.changed }}"
+          echo "导入方式: 快照导入，不携带上游 Git 历史"
+          echo "========================================"
+          echo "✅ 已完成学习项目快照更新"
